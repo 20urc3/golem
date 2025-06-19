@@ -298,6 +298,10 @@ def prepare_rag_analysis(report_dir: Path, findings: List[Dict], collection: chr
     for dot_file in sorted(slices_dir.glob('*.dot')):
         content += f"## {dot_file.name}\n```dot\n{dot_file.read_text()}\n```\n\n"
     content += "# Source Files\n\n"
+    cg_dir = report_dir / 'callgraphs'
+    content += "\n## Call Graphs\n\n"
+    for cg in sorted(cg_dir.glob("*.dot")):
+        content += f"### {cg.name}\n```dot\n{cg.read_text(errors='ignore')}\n```\n\n"
     for src_file in sorted(src_dir.rglob('*')):
         if src_file.is_file():
             content += f"## {src_file.name}\n```\n{src_file.read_text()}\n```\n\n"
@@ -412,7 +416,10 @@ def prepare_llm_analysis(report_dir: Path, findings: list) -> str:
         function = entry.get('function', 'N/A')
         rule_id = entry['finding'].get('rule_id', 'N/A')
         content += f"| {idx} | {file_name} | {line} | {function} | {rule_id} |\n"
-    
+    callgraph_dir = report_dir / 'callgraphs'
+    content += "\n## Call Graphs\n\n"
+    for cg in sorted(callgraph_dir.glob("*.dot")):
+        content += f"### {cg.name}\n```dot\n{cg.read_text(errors='ignore')}\n```\n\n"
     content += "\n## Source Code Context\n\n"
     src_dir = report_dir / 'src'
     if src_dir.exists():
