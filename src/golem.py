@@ -303,78 +303,85 @@ def send_to_ollama(
         print(f"[ERROR] Ollama analysis failed: {e}")
         raise
 
-
+def prepare_llm_analysis(report_dir: Path, findings: List[Dict]) -> str:
+    content = "# Security Analysis Report\n\n"
+    # List all received files
+    content += "## Files Received\n\n"
+    for subdir in ["src", "callgraphs", "dot_slices"]:
+        content += f"### {subdir}\n"
+        for f in sorted((report_dir / subdir).glob("*")):
+            if f.is_file():
+                content += f"- {f.name}\n"
+        content += "\n"
+    # Semgrep findings table
+    content += "## Semgrep Findings\n\n"
+    content += "| # | File | Line | Function | Rule |\n|---|------|------|----------|------|\n"
+    for i, e in enumerate(findings, 1):
+        fn = e.get("function", "N/A")
+        content += f"| {i} | {e['finding']['file']} | {e['finding']['line']} | {fn} | {e['finding'].get('rule_id','N/A')} |\n"
+    content += "\n"
+    # Embed call graphs
+    content += "## Call Graphs\n\n"
+    for cg in sorted((report_dir / "callgraphs").glob("*.dot")):
+        content += f"### {cg.name}\n```dot\n{cg.read_text(errors='ignore')}\n```\n\n"
+    # Embed CFG slices
+    content += "## CFG Slices\n\n"
+    for sl in sorted((report_dir / "dot_slices").glob("*.dot")):
+        content += f"### {sl.name}\n```dot\n{sl.read_text(errors='ignore')}\n```\n\n"
+    # Embed source files
+    content += "## Source Files\n\n"
+    for src in sorted((report_dir / "src").glob("*")):
+        content += f"### {src.name}\n```c\n{src.read_text(errors='ignore')}\n```\n\n"
+    # Analysis instructions
+    content += (
+        "## Analysis Task\n"
+        "First, list every file you received. Then for each finding:\n"
+        "1. Executive Summary\n"
+        "2. Per-Finding Decision Table\n"
+        "3. Conclusion\n"
+    )
+    return content
 
 def prepare_rag_analysis(report_dir: Path, findings: List[Dict], collection: chromadb.Collection) -> str:
-    src_dir = report_dir / 'src'
-    slices_dir = report_dir / 'dot_slices'
-    content = prompt + "\n\n# CFG Slices\n\n"
-    for dot_file in sorted(slices_dir.glob('*.dot')):
-        content += f"## {dot_file.name}\n```dot\n{dot_file.read_text()}\n```\n\n"
-    content += "# Source Files\n\n"
-    cg_dir = report_dir / 'callgraphs'
-    content += "\n## Call Graphs\n\n"
-    for cg in sorted(cg_dir.glob("*.dot")):
-        content += f"### {cg.name}\n```dot\n{cg.read_text(errors='ignore')}\n```\n\n"
-    for src_file in sorted(src_dir.rglob('*')):
-        if src_file.is_file():
-            content += f"## {src_file.name}\n```\n{src_file.read_text()}\n```\n\n"
-    content += "# Security Analysis Report\n\n## Semgrep Findings\n\n| # | File | Line | Function | Semgrep Rule |\n|---|------|------|----------|--------------|\n"
-    for idx, entry in enumerate(findings, 1):
-        file_name = entry['finding']['file']
-        line = entry['finding']['line']
-        function = entry.get('function', 'N/A')
-        rule_id = entry['finding'].get('rule_id', 'N/A')
-        content += f"| {idx} | {file_name} | {line} | {function} | {rule_id} |\n"
-    content += "\n## Code Context Analysis\n\n"
-    for idx, entry in enumerate(findings, 1):
-        content += f"### Finding {idx}: {entry['finding']['file']} (Line {entry['finding']['line']})\n\n"
-        query = f"vulnerability {entry['finding'].get('rule_id','')} {entry.get('function','')} security"
-        resp = ollama.embed(model="mxbai-embed-large", input=query)
-        raw = resp.get('embeddings') or resp.get('data',[{}])[0].get('embeddings')
-        if raw and isinstance(raw[0], (list, tuple)):
-            q_emb = raw[0]
-        else:
-            q_emb = raw
-        results = collection.query(
-            query_embeddings=[q_emb],
-            n_results=3
-        )
-        if results['documents']:
-            content += "**Related Code Context:**\n"
-            for doc_idx, doc in enumerate(results['documents'][0][:2]):
-                metadata = results['metadatas'][0][doc_idx]
-                content += f"\n*From {metadata['file']}:*\n```c\n{doc[:500]}...\n```\n"
+    content = "# RAG-Enriched Security Analysis\n\n"
+    # List files
+    content += "## Files Received\n\n"
+    for subdir in ["src", "callgraphs", "dot_slices"]:
+        content += f"### {subdir}\n"
+        for f in sorted((report_dir / subdir).glob("*")):
+            if f.is_file():
+                content += f"- **{subdir}/{f.name}**\n"
         content += "\n"
-    content += """## Analysis Task
-
-For each finding above, analyze the security implications using the provided code context:
-First: Make a section "File tree" and a tree of all the files you received for the analysis
-1. **Executive Summary**
-   - Summarize the overall security analysis process and outcomes.
-
-2. **Per-Finding Analysis**
-
-For each finding, provide:
-- **Reachability**: Can untrusted input reach this vulnerability?
-- **Sanitization**: Are there any input validation or sanitization mechanisms?
-- **Exploitability**: How easily can this be exploited?
-- **Impact**: What would be the impact if exploited?
-- **Verdict**: True Positive, False Positive, or Manual Review needed
-
-3. **Risk Assessment**
-   - Provide overall risk severity (Critical/High/Medium/Low)
-   - Prioritize findings by exploitability and impact
-   - Recommend specific remediation steps
-
-4. **Conclusion and Next Steps**
-   - Summary of critical issues that need immediate attention
-   - Recommended security improvements
-   - Suggested follow-up actions
-
-Please provide a comprehensive analysis based on the code context and security best practices.
-"""
+    # Semgrep findings
+    content += "## Semgrep Findings\n\n"
+    content += "| # | File | Line | Function | Rule |\n|---|------|------|----------|------|\n"
+    for i, e in enumerate(findings, 1):
+        fn = e.get("function", "N/A")
+        content += f"| {i} | {e['finding']['file']} | {e['finding']['line']} | {fn} | {e['finding'].get('rule_id','N/A')} |\n"
+    content += "\n"
+    # Attach call graphs
+    content += "## Call Graphs\n\n"
+    for cg in sorted((report_dir / "callgraphs").glob("*.dot")):
+        content += f"### {cg.name}\n```dot\n{cg.read_text(errors='ignore')}\n```\n\n"
+    # Attach CFG slices
+    content += "## CFG Slices\n\n"
+    for sl in sorted((report_dir / "dot_slices").glob("*.dot")):
+        content += f"### {sl.name}\n```dot\n{sl.read_text(errors='ignore')}\n```\n\n"
+    # Source context
+    content += "## Source Files\n\n"
+    for src in sorted((report_dir / "src").glob("*")):
+        content += f"### {src.name}\n```c\n{src.read_text(errors='ignore')}\n```\n\n"
+    # RAG prompt
+    content += (
+        "## Analysis Task\n"
+        "Use the above artifacts to:\n"
+        "1. Summarize the overall process and outcomes\n"
+        "2. For each finding, assess reachability, sanitization, exploitability, impact, verdict\n"
+        "3. Provide risk assessment and remediation steps\n"
+        "4. Conclude with next-steps recommendations\n"
+    )
     return content
+
 
 
 def send_to_gpt(report_dir: Path, findings: List[Dict]) -> str:
@@ -418,74 +425,6 @@ def send_to_gpt(report_dir: Path, findings: List[Dict]) -> str:
         raise
 
 
-def prepare_llm_analysis(report_dir: Path, findings: list) -> str:
-    content = "# Security Analysis Report\n\n"
-    
-    content += "## Semgrep Findings\n\n"
-    content += "| # | File | Line | Function | Semgrep Rule |\n"
-    content += "|---|------|------|----------|--------------|\n"
-    for idx, entry in enumerate(findings, 1):
-        file_name = entry['finding']['file']
-        line = entry['finding']['line']
-        function = entry.get('function', 'N/A')
-        rule_id = entry['finding'].get('rule_id', 'N/A')
-        content += f"| {idx} | {file_name} | {line} | {function} | {rule_id} |\n"
-    callgraph_dir = report_dir / 'callgraphs'
-    content += "\n## Call Graphs\n\n"
-    for cg in sorted(callgraph_dir.glob("*.dot")):
-        content += f"### {cg.name}\n```dot\n{cg.read_text(errors='ignore')}\n```\n\n"
-    content += "\n## Source Code Context\n\n"
-    src_dir = report_dir / 'src'
-    if src_dir.exists():
-        for entry in findings:
-            src_file = src_dir / Path(entry['finding']['file']).name
-            if src_file.exists():
-                lines = src_file.read_text().splitlines()
-                start = max(0, entry['finding']['line'] - 10)
-                end = min(len(lines), entry['finding']['line'] + 10)
-                content += f"### {entry['finding']['file']} (Line {entry['finding']['line']})\n\n"
-                content += "```c\n"
-                for i in range(start, end):
-                    marker = ">>> " if i + 1 == entry['finding']['line'] else "    "
-                    content += f"{marker}{i+1:4d}: {lines[i]}\n"
-                content += "```\n\n"
-    
-    # ── INCLUDE CFG SLICES ───────────────────────────────────────────────────────
-    slices_dir = report_dir / 'dot_slices'
-    if slices_dir.exists():
-        content += "## CFG Slices\n\n"
-        for dot_file in sorted(slices_dir.glob("*.dot")):
-            content += f"### {dot_file.name}\n"
-            content += "```dot\n"
-            content += dot_file.read_text()
-            content += "\n```\n\n"
-    
-    content += """## Analysis Task
-Do not give any answer, just follow instruction. 
-First list every file you received. 
-For each finding above, please provide:
-
-1. **Executive Summary**
-   - Summarize the overall security analysis process and outcomes.
-
-2. **Per-Finding Decision Table**
-
-| # | Function | Reachable? | Sanitized? | Verdict |
-|---|----------|------------|------------|---------|
-"""
-    for idx, entry in enumerate(findings, 1):
-        function = entry.get('function', 'N/A')
-        content += f"| {idx} | {function} |  |  |  |\n"
-    
-    content += """
-- **Reachable?**: Can untrusted input reach the sink?  
-- **Sanitized?**: Is there any sanitization or guard?  
-- **Verdict**: True Positive, False Positive, or Manual Review.
-
-3. **Conclusion**
-   - Provide overall risk severity and next steps recommendations.
-"""
-    return content
 
 
 def generate_local_report(report_dir: Path, findings: list) -> str:
@@ -511,7 +450,7 @@ Fill in the decision table above and provide your analysis:
 [Overall risk assessment and recommendations]
 """
     
-    local_report_path = report_dir / 'security_analysis_template.md'
+    local_report_path = report_dir
     local_report_path.write_text(report_content)
     
     print(f"[+] Local report template saved to: {local_report_path}")
@@ -612,6 +551,7 @@ def main():
             print("\x1b[93m[*] Falling back to local report generation...\x1b[0m")
             report_path = generate_local_report(report_dir, summary)
     elif args.mode == 'ollama':
+        subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             report_path = send_to_ollama(report_dir, summary, args.ollama_model)
         except Exception as e:
