@@ -39,9 +39,13 @@ make CC=clang \
 ```
 This will create .ll file(s) in your project folder
 
-# Program workflow 
+# General worflow
 1. Generate LLVM `.bc` file(s): 
     `clang -S -emit-llvm {TARGET.C/CXX} -o {TARGET.ll}`
 2. Transform the `.ll` file(s) into callgraph and control flow graph representation: 
     `opt -passes="dot-callgraph" {TARGET.ll}` -> `Writing 'vuln.ll.callgraph.dot'...`
     `opt -passes="dot-cfg" {TARGET.ll}`
+3. Run semgrep against the project of your choice.
+4. Analyze results and slice callgraph/control flow graph to enhance RAG
+5. Send prompt + files to RAG
+6. Return a report
