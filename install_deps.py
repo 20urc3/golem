@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import urllib.request
 import zipfile
+import time
 
 LLVM_VERSION = '18'
 GRAPHVIZ_CMD = 'dot'
@@ -94,7 +95,7 @@ def install_ollama_windows():
 def pull_lama3():
     # Pull lama3 model via Ollama
     print('Pulling lama3 model...')
-    run_command(['ollama', 'pull', 'lama3'])
+    run_command(['ollama', 'pull', 'llama3'])
 
 
 def main():
@@ -148,6 +149,10 @@ def main():
         print('Ollama is already installed.')
 
     # Pull lama3 model
+    server_proc = subprocess.Popen(['ollama', 'serve'],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    time.sleep(5)
     pull_lama3()
 
     print('Dependency check, installation, and model pull complete.')
