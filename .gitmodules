@@ -1,0 +1,3 @@
+[submodule "semgrep-rules"]
+	path = semgrep-rules
+	url = https://github.com/0xdea/semgrep-rules.git
