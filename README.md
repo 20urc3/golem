@@ -1,23 +1,10 @@
 # golem
 Golem automates C/C++ vulnerability discovery by combining Semgrep rule scans, LLVM call-graph & CFG slicing, and AI-driven context analysis. It flags potential security issues, generates rich graph artifacts, and leverages large-language models (GPT-4 or Ollama) to produce a detailed, prioritized audit report—so you can find and fix critical bugs faster.
 
-## Requirements
-- Python3
-- pip3
-- graphviz
-- LLVM >= 18
-- semgrep
-- pydot >= 4.0.1
-
-For local LLM version:
-- ollama >= 0.5.1
-- ChromaDB
-
-You can install them manually or run: `pip install -r requirements.txt`
 ## Usage
+Prepare your target project to analyze then run 
 
-Prepare your target project to analyze then run `usage: golem.py [-h] [--mode {local,gpt,ollama}] [--ollama-model OLLAMA_MODEL] project_dir`
-
+`golem.py [-h] [--mode {local,gpt,ollama}] [--ollama-model OLLAMA_MODEL] project_dir`
 ### Prepare your project
 Compile your target project with these flags:
 cmake:
@@ -39,6 +26,18 @@ make CC=clang \
 ```
 This will create .ll file(s) in your project folder
 
+## Requirements
+- Python3
+- pip3
+- graphviz
+- LLVM >= 18
+- semgrep
+- pydot >= 4.0.1
+
+For local LLM version:
+- ollama >= 0.5.1
+- ChromaDB
+You can install them manually or run: `pip install -r requirements.txt`
 # General worflow
 1. Generate LLVM `.bc` file(s): 
     `clang -S -emit-llvm {TARGET.C/CXX} -o {TARGET.ll}`
