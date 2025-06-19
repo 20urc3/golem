@@ -1,5 +1,5 @@
 # golem
-AI enhanced static analysis pipeline
+Golem automates C/C++ vulnerability discovery by combining Semgrep rule scans, LLVM call-graph & CFG slicing, and AI-driven context analysis. It flags potential security issues, generates rich graph artifacts, and leverages large-language models (GPT-4 or Ollama) to produce a detailed, prioritized audit report—so you can find and fix critical bugs faster.
 
 ## Requirements
 - Python3
