@@ -91,6 +91,12 @@ def install_ollama_windows():
     os.unlink(setup_path)
 
 
+def pull_lama3():
+    # Pull lama3 model via Ollama
+    print('Pulling lama3 model...')
+    run_command(['ollama', 'pull', 'lama3'])
+
+
 def main():
     # LLVM check
     llvm_cmd = f'llvm-config-{LLVM_VERSION}'
@@ -125,7 +131,7 @@ def main():
     else:
         print('Graphviz is already installed.')
 
-    # Ollama check
+    # Ollama check & install
     if not is_installed('ollama'):
         print('Ollama not found.')
         system = platform.system()
@@ -141,7 +147,10 @@ def main():
     else:
         print('Ollama is already installed.')
 
-    print('Dependency check and installation complete.')
+    # Pull lama3 model
+    pull_lama3()
+
+    print('Dependency check, installation, and model pull complete.')
 
 
 if __name__ == '__main__':
