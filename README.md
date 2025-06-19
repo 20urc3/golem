@@ -15,6 +15,10 @@ For local LLM version:
 
 You can install them manually or run: `pip install -r requirements.txt`
 ## Usage
+
+Prepare your target project to analyze then run `usage: golem.py [-h] [--mode {local,gpt,ollama}] [--ollama-model OLLAMA_MODEL] project_dir`
+
+### Prepare your project
 Compile your target project with these flags:
 cmake:
 ```

@@ -6,10 +6,12 @@ import glob
 import argparse
 import re
 import shutil
-import zipfile
 import openai
 import requests
 import chromadb
+import ollama
+from chromadb import PersistentClient
+from chromadb.config import Settings, DEFAULT_TENANT, DEFAULT_DATABASE
 import sys
 from pathlib import Path
 from typing import Set, List, Dict
@@ -17,6 +19,7 @@ import pydot
 import time
 import signal
 import psutil
+
 
 SEMgrep_RULES_DIR = Path(os.getcwd()) / 'semgrep-rules'
 CALLGRAPH_CMD = 'opt -passes="dot-callgraph"'
@@ -188,210 +191,147 @@ def copy_source_files(findings: list, project_dir: Path, report_dir: Path) -> No
     print(f"[+] Copied {copy_count} source files")
 
 
-def create_report_zip(report_dir: Path) -> Path:
-    print("[+] Creating report zip file...")
-    zip_path = report_dir.parent / f"{report_dir.name}.zip"
-    
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for file_path in report_dir.rglob('*'):
-            if file_path.is_file():
-                arcname = file_path.relative_to(report_dir.parent)
-                zipf.write(file_path, arcname)
-    
-    print(f"[+] Report zip created: {zip_path}")
-    return zip_path
-
-
 def setup_chromadb(report_dir: Path) -> chromadb.Collection:
-    print("[+] Setting up ChromaDB...")
-    chroma_client = chromadb.PersistentClient(path=str(report_dir / "chroma_db"))
-    collection = chroma_client.get_or_create_collection(name="security_analysis")
-    return collection
+    db_dir = report_dir / "chroma_db"
+    if db_dir.exists():
+        shutil.rmtree(db_dir)
+    client = PersistentClient(
+        path=str(db_dir),
+        settings=Settings(),
+        tenant=DEFAULT_TENANT,
+        database=DEFAULT_DATABASE,
+    )
+    try:
+        client.delete_collection("security_analysis")
+    except:
+        pass
+    return client.create_collection(name="security_analysis")
 
 
 def add_to_chromadb(collection: chromadb.Collection, findings: List[Dict], report_dir: Path) -> None:
-    print("[+] Adding source code to ChromaDB...")
-    documents = []
-    metadatas = []
-    ids = []
-    
     src_dir = report_dir / 'src'
-    if not src_dir.exists():
-        return
-    
     for idx, entry in enumerate(findings):
         src_file = src_dir / Path(entry['finding']['file']).name
-        if src_file.exists():
-            try:
-                content = src_file.read_text()
-                documents.append(content)
-                metadatas.append({
-                    "file": entry['finding']['file'],
-                    "line": entry['finding']['line'],
-                    "function": entry.get('function', 'N/A'),
-                    "rule_id": entry['finding'].get('rule_id', 'N/A')
-                })
-                ids.append(f"finding_{idx}")
-            except Exception as e:
-                print(f"  Error reading {src_file}: {e}")
-    
-    if documents:
+        if not src_file.exists():
+            continue
+        content = src_file.read_text()
+        resp = ollama.embed(model="mxbai-embed-large", input=content)
+        raw = resp.get('embeddings') or resp.get('data', [])[0]['embeddings']
+        if raw and isinstance(raw[0], (list, tuple)):
+            emb_batch = raw
+        else:
+            emb_batch = [raw]
         collection.add(
-            documents=documents,
-            metadatas=metadatas,
-            ids=ids
+            ids=[f"finding_{idx}"],
+            embeddings=emb_batch,
+            documents=[content],
+            metadatas=[{
+                "file": entry['finding']['file'],
+                "line": entry['finding']['line'],
+                "function": entry['function'],
+                "rule_id": entry['finding'].get('rule_id','N/A')
+            }]
         )
-        print(f"[+] Added {len(documents)} documents to ChromaDB")
 
 
-def query_chromadb(collection: chromadb.Collection, query: str, n_results: int = 5) -> List[Dict]:
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results
-    )
-    return results
 
-def is_ollama_running() -> bool:
+def retrieve_context(collection: chromadb.Collection, query: str, n_results: int = 3) -> List[str]:
+    resp = ollama.embed(model="mxbai-embed-large", input=query)
+    q_emb = resp.get('embeddings') or resp.get('data', [])[0]['embeddings']
+    results = collection.query(query_embeddings=[q_emb], n_results=n_results)
+    return results['documents'][0]
+
+
+
+def send_to_ollama(
+    report_dir: Path,
+    findings: List[Dict],
+    model: str = "llama3.2",
+    base_url: str = "http://localhost:11434",
+    max_retries: int = 3,
+    retry_delay: float = 2.0
+) -> str:
+    def wait_for_ollama():
+        health_url = f"{base_url}/api/version"
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = requests.get(health_url, timeout=retry_delay)
+                resp.raise_for_status()
+                return
+            except requests.RequestException:
+                if attempt == max_retries:
+                    raise ConnectionError(
+                        f"Cannot connect to Ollama at {base_url} after {max_retries} attempts"
+                    )
+                time.sleep(retry_delay)
+
+    print(f"[+] Waiting for Ollama at {base_url}…")
+    wait_for_ollama()
+    print(f"[+] Ollama is up! Using model '{model}'")
+
+    collection = setup_chromadb(report_dir)
+    add_to_chromadb(collection, findings, report_dir)
+
+    analysis_content = prepare_rag_analysis(report_dir, findings, collection)
+
     try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=5)
-        return response.status_code == 200
-    except:
-        return False
-
-def start_ollama() -> subprocess.Popen:
-    print("[+] Starting Ollama server...")
-    process = subprocess.Popen(
-        ['ollama', 'serve'],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        preexec_fn=os.setsid
-    )
-    
-    for i in range(30):
-        if is_ollama_running():
-            print("[+] Ollama server started successfully!")
-            return process
-        time.sleep(1)
-        print(f"[+] Waiting for Ollama to start... ({i+1}/30)")
-    
-    raise Exception("Ollama failed to start within 30 seconds")
-
-def stop_ollama(process: subprocess.Popen):
-    if process and process.poll() is None:
-        print("[+] Stopping Ollama server...")
-        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        process.wait(timeout=10)
-
-def ensure_model_available(model: str):
-    print(f"[+] Checking if model '{model}' is available...")
-    try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=10)
-        if response.status_code == 200:
-            models = response.json().get('models', [])
-            available_models = [m['name'] for m in models]
-            if model not in available_models:
-                print(f"[+] Model '{model}' not found. Pulling...")
-                pull_process = subprocess.run(
-                    ['ollama', 'pull', model],
-                    capture_output=True,
-                    text=True,
-                    timeout=600
-                )
-                if pull_process.returncode != 0:
-                    raise Exception(f"Failed to pull model: {pull_process.stderr}")
-                print(f"[+] Model '{model}' pulled successfully!")
-            else:
-                print(f"[+] Model '{model}' is already available!")
-    except Exception as e:
-        raise Exception(f"Failed to ensure model availability: {e}")
-
-def send_to_ollama(report_dir: Path, findings: List[Dict], model: str = "llama3.1") -> str:
-    ollama_process = None
-    try:
-        if not is_ollama_running():
-            ollama_process = start_ollama()
-        
-        ensure_model_available(model)
-        
-        print(f"[+] Sending analysis to Ollama ({model})...")
-        
-        collection = setup_chromadb(report_dir)
-        add_to_chromadb(collection, findings, report_dir)
-        
-        analysis_content = prepare_rag_analysis(report_dir, findings, collection)
-        
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": model,
-                "prompt": analysis_content,
-                "stream": False
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=300
+        resp = ollama.generate(
+            model=model,
+            prompt=analysis_content
         )
-        
-        if response.status_code != 200:
-            raise Exception(f"Ollama API returned status {response.status_code}: {response.text}")
-        
-        result = response.json()
-        ollama_analysis = result.get("response", "")
-        
-        if not ollama_analysis:
-            raise Exception("Empty response from Ollama")
-        
-        ollama_report_path = report_dir / 'ollama_analysis.md'
-        ollama_report_path.write_text(ollama_analysis)
-        
-        print("[+] Ollama analysis complete and saved to ollama_analysis.md")
-        return str(ollama_report_path)
-        
+        ollama_analysis = resp.get('response', '').strip() or resp.strip()
+        out_path = report_dir / "ollama_analysis.md"
+        out_path.write_text(ollama_analysis, encoding="utf-8")
+        print(f"[+] Ollama analysis complete → {out_path.name}")
+        return str(out_path)
+
     except Exception as e:
-        print(f"\x1b[91m[ERROR] Failed to get Ollama analysis: {e}\x1b[0m")
+        print(f"[ERROR] Ollama analysis failed: {e}")
         raise
-    finally:
-        if ollama_process:
-            stop_ollama(ollama_process)
+
+
 
 def prepare_rag_analysis(report_dir: Path, findings: List[Dict], collection: chromadb.Collection) -> str:
-    content = """You are a security auditor assistant. Analyze the provided Semgrep findings using the context from the codebase.
-
-# Security Analysis Report
-
-## Semgrep Findings
-
-| # | File | Line | Function | Semgrep Rule |
-|---|------|------|----------|--------------|
-"""
-    
+    src_dir = report_dir / 'src'
+    slices_dir = report_dir / 'dot_slices'
+    content = prompt + "\n\n# CFG Slices\n\n"
+    for dot_file in sorted(slices_dir.glob('*.dot')):
+        content += f"## {dot_file.name}\n```dot\n{dot_file.read_text()}\n```\n\n"
+    content += "# Source Files\n\n"
+    for src_file in sorted(src_dir.rglob('*')):
+        if src_file.is_file():
+            content += f"## {src_file.name}\n```\n{src_file.read_text()}\n```\n\n"
+    content += "# Security Analysis Report\n\n## Semgrep Findings\n\n| # | File | Line | Function | Semgrep Rule |\n|---|------|------|----------|--------------|\n"
     for idx, entry in enumerate(findings, 1):
         file_name = entry['finding']['file']
         line = entry['finding']['line']
         function = entry.get('function', 'N/A')
         rule_id = entry['finding'].get('rule_id', 'N/A')
         content += f"| {idx} | {file_name} | {line} | {function} | {rule_id} |\n"
-    
     content += "\n## Code Context Analysis\n\n"
-    
     for idx, entry in enumerate(findings, 1):
         content += f"### Finding {idx}: {entry['finding']['file']} (Line {entry['finding']['line']})\n\n"
-        
-        query = f"vulnerability {entry['finding'].get('rule_id', '')} {entry.get('function', '')} security"
-        rag_results = query_chromadb(collection, query, n_results=3)
-        
-        if rag_results['documents']:
+        query = f"vulnerability {entry['finding'].get('rule_id','')} {entry.get('function','')} security"
+        resp = ollama.embed(model="mxbai-embed-large", input=query)
+        raw = resp.get('embeddings') or resp.get('data',[{}])[0].get('embeddings')
+        if raw and isinstance(raw[0], (list, tuple)):
+            q_emb = raw[0]
+        else:
+            q_emb = raw
+        results = collection.query(
+            query_embeddings=[q_emb],
+            n_results=3
+        )
+        if results['documents']:
             content += "**Related Code Context:**\n"
-            for doc_idx, doc in enumerate(rag_results['documents'][0][:2]):
-                metadata = rag_results['metadatas'][0][doc_idx]
-                content += f"\n*From {metadata['file']}:*\n"
-                content += f"```c\n{doc[:500]}...\n```\n"
-        
+            for doc_idx, doc in enumerate(results['documents'][0][:2]):
+                metadata = results['metadatas'][0][doc_idx]
+                content += f"\n*From {metadata['file']}:*\n```c\n{doc[:500]}...\n```\n"
         content += "\n"
-    
     content += """## Analysis Task
 
 For each finding above, analyze the security implications using the provided code context:
-
+First: Make a section "File tree" and a tree of all the files you received for the analysis
 1. **Executive Summary**
    - Summarize the overall security analysis process and outcomes.
 
@@ -416,7 +356,6 @@ For each finding, provide:
 
 Please provide a comprehensive analysis based on the code context and security best practices.
 """
-    
     return content
 
 
@@ -429,7 +368,7 @@ def send_to_gpt(report_dir: Path, findings: List[Dict]) -> str:
     
     client = openai.OpenAI(api_key=api_key)
     
-    analysis_content = prepare_gpt_analysis(report_dir, findings)
+    analysis_content = prepare_llm_analysis(report_dir, findings)
     
     try:
         response = client.chat.completions.create(
@@ -461,13 +400,12 @@ def send_to_gpt(report_dir: Path, findings: List[Dict]) -> str:
         raise
 
 
-def prepare_gpt_analysis(report_dir: Path, findings: list) -> str:
+def prepare_llm_analysis(report_dir: Path, findings: list) -> str:
     content = "# Security Analysis Report\n\n"
     
     content += "## Semgrep Findings\n\n"
     content += "| # | File | Line | Function | Semgrep Rule |\n"
     content += "|---|------|------|----------|--------------|\n"
-    
     for idx, entry in enumerate(findings, 1):
         file_name = entry['finding']['file']
         line = entry['finding']['line']
@@ -476,28 +414,34 @@ def prepare_gpt_analysis(report_dir: Path, findings: list) -> str:
         content += f"| {idx} | {file_name} | {line} | {function} | {rule_id} |\n"
     
     content += "\n## Source Code Context\n\n"
-    
     src_dir = report_dir / 'src'
     if src_dir.exists():
         for entry in findings:
             src_file = src_dir / Path(entry['finding']['file']).name
             if src_file.exists():
+                lines = src_file.read_text().splitlines()
+                start = max(0, entry['finding']['line'] - 10)
+                end = min(len(lines), entry['finding']['line'] + 10)
                 content += f"### {entry['finding']['file']} (Line {entry['finding']['line']})\n\n"
-                try:
-                    lines = src_file.read_text().splitlines()
-                    start_line = max(0, entry['finding']['line'] - 10)
-                    end_line = min(len(lines), entry['finding']['line'] + 10)
-                    
-                    content += "```c\n"
-                    for i in range(start_line, end_line):
-                        marker = ">>> " if i + 1 == entry['finding']['line'] else "    "
-                        content += f"{marker}{i+1:4d}: {lines[i]}\n"
-                    content += "```\n\n"
-                except Exception as e:
-                    content += f"Error reading file: {e}\n\n"
+                content += "```c\n"
+                for i in range(start, end):
+                    marker = ">>> " if i + 1 == entry['finding']['line'] else "    "
+                    content += f"{marker}{i+1:4d}: {lines[i]}\n"
+                content += "```\n\n"
+    
+    # ── INCLUDE CFG SLICES ───────────────────────────────────────────────────────
+    slices_dir = report_dir / 'dot_slices'
+    if slices_dir.exists():
+        content += "## CFG Slices\n\n"
+        for dot_file in sorted(slices_dir.glob("*.dot")):
+            content += f"### {dot_file.name}\n"
+            content += "```dot\n"
+            content += dot_file.read_text()
+            content += "\n```\n\n"
     
     content += """## Analysis Task
-
+Do not give any answer, just follow instruction. 
+First list every file you received. 
 For each finding above, please provide:
 
 1. **Executive Summary**
@@ -508,7 +452,6 @@ For each finding above, please provide:
 | # | Function | Reachable? | Sanitized? | Verdict |
 |---|----------|------------|------------|---------|
 """
-    
     for idx, entry in enumerate(findings, 1):
         function = entry.get('function', 'N/A')
         content += f"| {idx} | {function} |  |  |  |\n"
@@ -521,14 +464,13 @@ For each finding above, please provide:
 3. **Conclusion**
    - Provide overall risk severity and next steps recommendations.
 """
-    
     return content
 
 
 def generate_local_report(report_dir: Path, findings: list) -> str:
     print("[+] Generating local markdown report...")
     
-    report_content = prepare_gpt_analysis(report_dir, findings)
+    report_content = prepare_llm_analysis(report_dir, findings)
     
     report_content += """
 
@@ -564,8 +506,8 @@ def main():
     parser.add_argument('project_dir', type=Path, help='Path to C/C++ project')
     parser.add_argument('--mode', '-m', choices=['local', 'gpt', 'ollama'], default='local', 
                        help='Analysis mode: local (generate template), gpt (send to GPT-4), or ollama (send to Ollama)')
-    parser.add_argument('--ollama-model', default='llama3.1', 
-                       help='Ollama model to use (default: llama3.1)')
+    parser.add_argument('--ollama-model', default='llama3', 
+                       help='Ollama model to use (default: llama3)')
     args = parser.parse_args(); project = args.project_dir.resolve(); cwd = Path.cwd()
 
     print(r"""
@@ -659,12 +601,21 @@ def main():
         report_path = generate_local_report(report_dir, summary)
         print("\x1b[93m[*] No super-intelligence (even AGI achieved in-house) have been passed.. just creating files and leaving!\x1b[0m")
 
-    zip_path = create_report_zip(report_dir)
-    print(f"\x1b[96m[+] Report zip available at: {zip_path}\x1b[0m")
-
     if report_path:
-            print(f"\x1b[92m[✔]\x1b[0m \x1b[96mGolem\x1b[0m smashed some bugs! Your report wait at: \x1b[92m{report_path}\x1b[0m")
-            
+        report_name = Path(report_path).name
+        try:
+            dest = cwd / report_name
+            shutil.copy2(report_path, dest)
+            print(f"[+] Copied report to: {dest}")
+        except Exception as e:
+            print(f"[!] Failed to copy report to cwd: {e}")
+        
+        # original notification
+        print(
+            f"\x1b[92m[✔]\x1b[96m Golem\x1b[0m smashed some bugs! "
+            f"Your report waits at: \x1b[92m./{report_name}\x1b[0m "
+            f"(also in \x1b[92m./golem_report/{report_name}\x1b[0m)"
+        )  
     print("\x1b[92m[✔] Report is ready in 'golem_report'! Golem rests, security prevails.\x1b[0m")
 
 
