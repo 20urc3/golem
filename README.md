@@ -2,7 +2,9 @@
 Golem automates C/C++ vulnerability discovery by combining Semgrep rule scans, LLVM call-graph & CFG slicing, and AI-driven context analysis. It flags potential security issues, generates rich graph artifacts, and leverages large-language models (GPT-4 or Ollama) to produce a detailed, prioritized audit report—so you can find and fix critical bugs faster.
 
 ## Usage
-Prepare your target project to analyze then run `usage: golem.py [-h] [--mode {local,gpt,ollama}] [--ollama-model OLLAMA_MODEL] project_dir`
+Prepare your target project to analyze then run 
+
+`golem.py [-h] [--mode {local,gpt,ollama}] [--ollama-model OLLAMA_MODEL] project_dir`
 ### Prepare your project
 Compile your target project with these flags:
 cmake:
