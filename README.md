@@ -48,3 +48,9 @@ You can install them manually or run: `pip install -r requirements.txt`
 4. Analyze results and slice callgraph/control flow graph to enhance RAG
 5. Send prompt + files to RAG
 6. Return a report
+
+# Trophies
+If you find a bug with this tool, please report it ! We'll gladly add it to the list :)
+
+# Contributors
+- Author(s): 2ourc3 - Salim LARGO
