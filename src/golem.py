@@ -91,13 +91,22 @@ def run_semgrep(project_dir: Path, report_dir: Path) -> bool:
     print(f"[+] Now scanning for vulnerabilities with Semgrep in '{project_dir}'...")
     output_path = report_dir / SEMgrep_OUTPUT
     proc = subprocess.run(
-        ['semgrep', '--config', str(SEMgrep_RULES_DIR), f'--json-output={output_path}', str(project_dir)],
+        [
+            'semgrep',
+            '--timeout', '300',
+            '--timeout-threshold', '0',  
+            '--max-target-bytes', '0',
+            '--config', str(SEMgrep_RULES_DIR),
+            f'--json-output={output_path}',
+            str(project_dir)
+        ],
         cwd=project_dir,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
     print("[+] Semgrep scan done!")
     return proc.returncode == 0
+
 
 
 def load_semgrep_results(path: Path) -> list:
