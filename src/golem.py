@@ -459,7 +459,7 @@ Fill in the decision table above and provide your analysis:
 [Overall risk assessment and recommendations]
 """
     
-    local_report_path = report_dir
+    local_report_path = report_dir / 'local_analysis.md'
     local_report_path.write_text(report_content)
     
     print(f"[+] Local report template saved to: {local_report_path}")
