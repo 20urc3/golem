@@ -20,6 +20,7 @@ import glob
 import argparse
 import re
 import shutil
+import requests
 import openai
 import requests
 import chromadb
@@ -265,7 +266,6 @@ def retrieve_context(collection: chromadb.Collection, query: str, n_results: int
     return results['documents'][0]
 
 
-
 def send_to_ollama(
     report_dir: Path,
     findings: List[Dict],
@@ -274,6 +274,7 @@ def send_to_ollama(
     max_retries: int = 3,
     retry_delay: float = 2.0
 ) -> str:
+    
     def wait_for_ollama():
         health_url = f"{base_url}/api/version"
         for attempt in range(1, max_retries + 1):
@@ -281,10 +282,13 @@ def send_to_ollama(
                 resp = requests.get(health_url, timeout=retry_delay)
                 resp.raise_for_status()
                 return
-            except requests.RequestException:
+            except requests.RequestException as e:
+                print(f"  Attempt {attempt}/{max_retries}: Cannot connect to Ollama at {base_url}")
                 if attempt == max_retries:
                     raise ConnectionError(
-                        f"Cannot connect to Ollama at {base_url} after {max_retries} attempts"
+                        f"Cannot connect to Ollama at {base_url} after {max_retries} attempts.\n"
+                        f"Make sure Ollama is running: 'ollama serve' (on host machine)\n"
+                        f"Check URL: {base_url}"
                     )
                 time.sleep(retry_delay)
 
@@ -298,16 +302,34 @@ def send_to_ollama(
     analysis_content = prepare_rag_analysis(report_dir, findings, collection)
 
     try:
-        resp = ollama.generate(
-            model=model,
-            prompt=analysis_content
+        response = requests.post(
+            f"{base_url}/api/generate",
+            json={
+                "model": model,
+                "prompt": analysis_content,
+                "stream": False
+            },
+            timeout=300
         )
-        ollama_analysis = resp.get('response', '').strip() or resp.strip()
+        response.raise_for_status()
+        
+        result = response.json()
+        ollama_analysis = result.get('response', '').strip()
+        
+        if not ollama_analysis:
+            raise ValueError("Empty response from Ollama")
+            
         out_path = report_dir / "ollama_analysis.md"
         out_path.write_text(ollama_analysis, encoding="utf-8")
         print(f"[+] Ollama analysis complete → {out_path.name}")
         return str(out_path)
 
+    except requests.exceptions.Timeout:
+        print(f"[ERROR] Ollama request timeout after 300 seconds")
+        raise
+    except requests.exceptions.ConnectionError as e:
+        print(f"[ERROR] Cannot connect to Ollama at {base_url}: {e}")
+        raise
     except Exception as e:
         print(f"[ERROR] Ollama analysis failed: {e}")
         raise
@@ -459,7 +481,7 @@ Fill in the decision table above and provide your analysis:
 [Overall risk assessment and recommendations]
 """
     
-    local_report_path = report_dir
+    local_report_path = report_dir / 'local_analysis.md'
     local_report_path.write_text(report_content)
     
     print(f"[+] Local report template saved to: {local_report_path}")
@@ -477,6 +499,8 @@ def main():
                        help='Analysis mode: local (generate template), gpt (send to GPT-4), or ollama (send to Ollama)')
     parser.add_argument('--ollama-model', default='llama3', 
                        help='Ollama model to use (default: llama3)')
+    parser.add_argument('--ollama-url', dest='ollama_url', default='http://localhost:11434', 
+                       help='Ollama server url (default: http://localhost:11434)')
     args = parser.parse_args(); project = args.project_dir.resolve(); cwd = Path.cwd()
 
     print(r"""
@@ -560,9 +584,12 @@ def main():
             print("\x1b[93m[*] Falling back to local report generation...\x1b[0m")
             report_path = generate_local_report(report_dir, summary)
     elif args.mode == 'ollama':
-        subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            report_path = send_to_ollama(report_dir, summary, args.ollama_model)
+            report_path = send_to_ollama(
+                report_dir, summary, 
+                model=args.ollama_model,
+                base_url=args.ollama_url
+            )
         except Exception as e:
             print(f"\x1b[91m[ERROR] Ollama analysis failed: {e}\x1b[0m")
             print("\x1b[93m[*] Falling back to local report generation...\x1b[0m")
