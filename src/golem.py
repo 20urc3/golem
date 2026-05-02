@@ -477,6 +477,8 @@ def main():
                        help='Analysis mode: local (generate template), gpt (send to GPT-4), or ollama (send to Ollama)')
     parser.add_argument('--ollama-model', default='llama3', 
                        help='Ollama model to use (default: llama3)')
+    parser.add_argument('--ollama-url', default='http://localhost:11434', 
+                       help='Ollama server url (default: http://localhost:11434)')
     args = parser.parse_args(); project = args.project_dir.resolve(); cwd = Path.cwd()
 
     print(r"""
@@ -562,7 +564,7 @@ def main():
     elif args.mode == 'ollama':
         subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            report_path = send_to_ollama(report_dir, summary, args.ollama_model)
+            report_path = send_to_ollama(report_dir, summary, args.ollama_model, args.ollama_url)
         except Exception as e:
             print(f"\x1b[91m[ERROR] Ollama analysis failed: {e}\x1b[0m")
             print("\x1b[93m[*] Falling back to local report generation...\x1b[0m")
