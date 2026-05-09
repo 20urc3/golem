@@ -310,12 +310,12 @@ def send_to_ollama(
     wait_for_ollama()
     print(f"[+] Ollama is up! Using model '{model}', lang='{lang}'")
 
+    # TODO check that it usage
     collection = setup_chromadb(report_dir)
     add_to_chromadb(collection, findings, report_dir)
 
     system_prompt = get_system_prompt(lang)
-    # TODO build report content
-    analysis_content = prepare_rag_analysis(report_dir, findings, collection)
+    analysis_content = _build_report_content(report_dir, findings)
     full_prompt = f"{system_prompt}\n\n{analysis_content}"
 
     response = requests.post(
@@ -336,7 +336,74 @@ def send_to_ollama(
     print(f"[+] Ollama analysis saved to {out_path.name}")
     return str(out_path)
 
-def prepare_llm_analysis(report_dir: Path, findings: List[Dict]) -> str:
+def send_to_llamacpp(
+    report_dir: Path,
+    findings: List[Dict],
+    base_url: str,
+    api_key: str = "",
+    model: str = "default",
+    lang: str = "en",
+    max_tokens: int = 4096,
+    temperature: float = 0.1,
+) -> str:
+    health_url = f"{base_url.rstrip('/')}/health"
+    try:
+        r = requests.get(health_url, timeout=10)
+        print(f"[+] llama-cpp server is up at {base_url} (status: {r.status_code})")
+    except requests.RequestException:
+        # if /health not present
+        try:
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            r = requests.get(f"{base_url.rstrip('/')}/v1/models",
+                             headers=headers, timeout=10)
+            print(f"[+] llama-cpp server is up at {base_url}")
+        except requests.RequestException as e:
+            raise ConnectionError(
+                f"Cannot reach llama-cpp server at {base_url}.\n"
+                f"Start it with: python -m llama_cpp.server --model <model.gguf> "
+                f"--host 0.0.0.0 --port 8080\n"
+                f"Error: {e}"
+            )
+
+    analysis_content = _build_report_content(report_dir, findings)
+    system_prompt = get_system_prompt(lang)
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": analysis_content},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": False,
+    }
+
+    print(f"[+] Sending analysis to llama-cpp ({base_url}), model='{model}', lang='{lang}'...")
+    response = requests.post(
+        f"{base_url.rstrip('/')}/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=600,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    analysis = data["choices"][0]["message"]["content"].strip()
+    if not analysis:
+        raise ValueError("Empty response from llama-cpp server")
+
+    out_path = report_dir / "llamacpp_analysis.md"
+    out_path.write_text(analysis, encoding="utf-8")
+    print(f"[+] llama-cpp analysis saved → {out_path.name}")
+    return str(out_path)
+
+
+def _build_report_content(report_dir: Path, findings: List[Dict]) -> str:
     content = "# Security Analysis Report\n\n"
     # List all received files
     content += "## Files Received\n\n"
@@ -346,6 +413,7 @@ def prepare_llm_analysis(report_dir: Path, findings: List[Dict]) -> str:
             if f.is_file():
                 content += f"- {f.name}\n"
         content += "\n"
+
     # Semgrep findings table
     content += "## Semgrep Findings\n\n"
     content += "| # | File | Line | Function | Rule |\n|---|------|------|----------|------|\n"
@@ -353,14 +421,17 @@ def prepare_llm_analysis(report_dir: Path, findings: List[Dict]) -> str:
         fn = e.get("function", "N/A")
         content += f"| {i} | {e['finding']['file']} | {e['finding']['line']} | {fn} | {e['finding'].get('rule_id','N/A')} |\n"
     content += "\n"
+
     # Embed call graphs
     content += "## Call Graphs\n\n"
     for cg in sorted((report_dir / "callgraphs").glob("*.dot")):
         content += f"### {cg.name}\n```dot\n{cg.read_text(errors='ignore')}\n```\n\n"
+
     # Embed CFG slices
     content += "## CFG Slices\n\n"
     for sl in sorted((report_dir / "dot_slices").glob("*.dot")):
         content += f"### {sl.name}\n```dot\n{sl.read_text(errors='ignore')}\n```\n\n"
+
     # Embed source files
     content += "## Source Files\n\n"
     for src in sorted((report_dir / "src").glob("*")):
@@ -375,47 +446,6 @@ def prepare_llm_analysis(report_dir: Path, findings: List[Dict]) -> str:
     )
     return content
 
-def prepare_rag_analysis(report_dir: Path, findings: List[Dict], collection: chromadb.Collection) -> str:
-    content = "# RAG-Enriched Security Analysis\n\n"
-    # List files
-    content += "## Files Received\n\n"
-    for subdir in ["src", "callgraphs", "dot_slices"]:
-        content += f"### {subdir}\n"
-        for f in sorted((report_dir / subdir).glob("*")):
-            if f.is_file():
-                content += f"- **{subdir}/{f.name}**\n"
-        content += "\n"
-    # Semgrep findings
-    content += "## Semgrep Findings\n\n"
-    content += "| # | File | Line | Function | Rule |\n|---|------|------|----------|------|\n"
-    for i, e in enumerate(findings, 1):
-        fn = e.get("function", "N/A")
-        content += f"| {i} | {e['finding']['file']} | {e['finding']['line']} | {fn} | {e['finding'].get('rule_id','N/A')} |\n"
-    content += "\n"
-    # Attach call graphs
-    content += "## Call Graphs\n\n"
-    for cg in sorted((report_dir / "callgraphs").glob("*.dot")):
-        content += f"### {cg.name}\n```dot\n{cg.read_text(errors='ignore')}\n```\n\n"
-    # Attach CFG slices
-    content += "## CFG Slices\n\n"
-    for sl in sorted((report_dir / "dot_slices").glob("*.dot")):
-        content += f"### {sl.name}\n```dot\n{sl.read_text(errors='ignore')}\n```\n\n"
-    # Source context
-    content += "## Source Files\n\n"
-    for src in sorted((report_dir / "src").glob("*")):
-        content += f"### {src.name}\n```c\n{src.read_text(errors='ignore')}\n```\n\n"
-    # RAG prompt
-    content += (
-        "## Analysis Task\n"
-        "Use the above artifacts to:\n"
-        "1. Summarize the overall process and outcomes\n"
-        "2. For each finding, assess reachability, sanitization, exploitability, impact, verdict\n"
-        "3. Provide risk assessment and remediation steps\n"
-        "4. Conclude with next-steps recommendations\n"
-    )
-    return content
-
-
 
 def send_to_gpt(report_dir: Path, findings: List[Dict],
                 lang: str = "en") -> str:
@@ -425,8 +455,7 @@ def send_to_gpt(report_dir: Path, findings: List[Dict],
     
     print("[+] Sending analysis to ChatGPT, lang='{lang}'...")
     client = openai.OpenAI(api_key=api_key)
-    # TODO use build_report_content
-    analysis_content = prepare_llm_analysis(report_dir, findings)
+    analysis_content = _build_report_content(report_dir, findings)
     system_prompt = get_system_prompt(lang)
 
     response = client.chat.completions.create(
@@ -448,32 +477,17 @@ def send_to_gpt(report_dir: Path, findings: List[Dict],
 
 def generate_local_report(report_dir: Path, findings: list) -> str:
     print("[+] Generating local markdown report...")
-    
-    report_content = prepare_llm_analysis(report_dir, findings)
-    
-    report_content += """
-
----
-
-## Manual Analysis Template
-
-Fill in the decision table above and provide your analysis:
-
-### Executive Summary
-[Your analysis here]
-
-### Detailed Analysis
-[Per-finding analysis here]
-
-### Conclusion
-[Overall risk assessment and recommendations]
-"""
-    
-    local_report_path = report_dir / 'local_analysis.md'
-    local_report_path.write_text(report_content)
-    
-    print(f"[+] Local report template saved to: {local_report_path}")
-    return str(local_report_path)
+    content = _build_report_content(report_dir, findings)
+    content += (
+        "\n---\n\n## Manual Analysis Template\n\n"
+        "### Executive Summary\n[Your analysis here]\n\n"
+        "### Detailed Analysis\n[Per-finding analysis here]\n\n"
+        "### Conclusion\n[Overall risk assessment and recommendations]\n"
+    )
+    out_path = report_dir / 'local_analysis.md'
+    out_path.write_text(content, encoding="utf-8")
+    print(f"[+] Local report template saved to: {out_path.name}")
+    return str(out_path)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -520,7 +534,23 @@ def build_parser() -> argparse.ArgumentParser:
         '--ollama-model', default='llama3', metavar='MODEL', 
         help='Ollama model name')
 
-    # TODO llama-cpp
+    # llama-cpp
+    llamacpp_g = parser.add_argument_group('llama-cpp options (--mode llamacpp)')
+    llamacpp_g.add_argument(
+        '--llamacpp-url', default='http://localhost:8080', metavar='URL',
+        help='llama-cpp-python server URL (OpenAI-compatible)')
+    llamacpp_g.add_argument(
+        '--llamacpp-key', default='', metavar='KEY',
+        help='API key for llama-cpp server (if --api-key was set on server)')
+    llamacpp_g.add_argument(
+        '--llamacpp-model', default='default', metavar='MODEL',
+        help='Model name to send in the request (for multi-model servers)')
+    llamacpp_g.add_argument(
+        '--llamacpp-max-tokens', type=int, default=4096, metavar='N',
+        help='max_tokens for llama-cpp generation')
+    llamacpp_g.add_argument(
+        '--llamacpp-temperature', type=float, default=0.1, metavar='F',
+        help='Temperature for llama-cpp generation')
 
     # Output
     out_g = parser.add_argument_group('Output options')
@@ -631,7 +661,16 @@ def main():
                 base_url=args.ollama_url,
                 lang=args.lang
             )
-        # TODO add llamacpp    
+        elif args.mode == 'llamacpp':
+            report_path = send_to_llamacpp(
+                report_dir, summary,
+                base_url=args.llamacpp_url,
+                api_key=args.llamacpp_key,
+                model=args.llamacpp_model,
+                lang=args.lang,
+                max_tokens=args.llamacpp_max_tokens,
+                temperature=args.llamacpp_temperature,
+            )
         else: # local
             report_path = generate_local_report(report_dir, summary)
             print("\x1b[93m[*] No super-intelligence (even AGI achieved in-house) have been passed.. just creating files and leaving!\x1b[0m")    
