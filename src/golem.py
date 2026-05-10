@@ -426,6 +426,7 @@ def send_to_ollama(
     model: str = "llama3.2",
     base_url: str = "http://localhost:11434",
     lang: str = "en",
+    include_sources: bool = False,
     max_retries: int = 3,
     retry_delay: float = 2.0
 ) -> str:
@@ -449,12 +450,12 @@ def send_to_ollama(
     print(f"[+] Ollama is up! Using model '{model}', lang='{lang}'")
 
     # TODO check that it usage
-    collection = setup_chromadb(report_dir)
-    add_to_chromadb(collection, findings, report_dir)
+    #collection = setup_chromadb(report_dir)
+    #add_to_chromadb(collection, findings, report_dir)
 
-    system_prompt = get_system_prompt(lang)
-    analysis_content = _build_report_content(report_dir, findings)
-    full_prompt = f"{system_prompt}\n\n{analysis_content}"
+    full_prompt = (get_system_prompt(lang) + "\n\n"
+            + _build_report_content(report_dir, findings,
+                                    include_sources=include_sources))
 
     response = requests.post(
         f"{base_url}/api/generate",
@@ -483,6 +484,7 @@ def send_to_llamacpp(
     lang: str = "en",
     max_tokens: int = 4096,
     temperature: float = 0.1,
+    include_sources: bool = False,
 ) -> str:
     health_url = f"{base_url.rstrip('/')}/health"
     try:
@@ -503,8 +505,18 @@ def send_to_llamacpp(
                 f"Error: {e}"
             )
 
-    analysis_content = _build_report_content(report_dir, findings)
+    analysis_content = _build_report_content(report_dir, findings, include_sources=include_sources)
     system_prompt = get_system_prompt(lang)
+
+    est_chars = len(system_prompt) + len(analysis_content)
+    est_tokens = est_chars // 4
+    print(f"[+] Prompt: ~{est_chars:,} chars (~{est_tokens:,} tokens estimated)")
+    if est_tokens > max_tokens * 0.8:
+        print(
+            f"  [!] Prompt (~{est_tokens} tok) is >80% max_tokens ({max_tokens}).\n"
+            f"      Fix: increase --n_ctx and --llamacpp-max-tokens on server\n"
+            f"      or decrease Semgrep rules count (--semgrep-exclude)."
+        )
 
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -531,6 +543,13 @@ def send_to_llamacpp(
     response.raise_for_status()
 
     data = response.json()
+    finish = data.get("choices", [{}])[0].get("finish_reason", "")
+    if finish == "length":
+        print(
+            "  [!] finish_reason=length: response was cropped!\n"
+            "      Increase --n_ctx and --llamacpp-max-tokens."
+        )
+
     analysis = data["choices"][0]["message"]["content"].strip()
     if not analysis:
         raise ValueError("Empty response from llama-cpp server")
@@ -540,8 +559,20 @@ def send_to_llamacpp(
     print(f"[+] llama-cpp analysis saved → {out_path.name}")
     return str(out_path)
 
+def _truncate(text: str, max_chars: int, label: str = "") -> str:
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    marker = f"\n\n... [{label} TRUNCATED {len(text):,} → {max_chars:,} chars] ...\n\n"
+    return text[:half] + marker + text[-half:]
 
-def _build_report_content(report_dir: Path, findings: List[Dict]) -> str:
+def _build_report_content(
+    report_dir: Path, 
+    findings: List[Dict],
+    include_sources: bool = False,
+    max_dot_chars: int = 8_000,
+    max_src_chars: int = 6_000,
+    ) -> str:
     content = "# Security Analysis Report\n\n"
     # List all received files
     content += "## Files Received\n\n"
@@ -554,46 +585,86 @@ def _build_report_content(report_dir: Path, findings: List[Dict]) -> str:
 
     # Semgrep findings table
     content += "## Semgrep Findings\n\n"
-    content += "| # | File | Line | Function | Rule |\n|---|------|------|----------|------|\n"
-    for i, e in enumerate(findings, 1):
-        fn = e.get("function", "N/A")
-        content += f"| {i} | {e['finding']['file']} | {e['finding']['line']} | {fn} | {e['finding'].get('rule_id','N/A')} |\n"
-    content += "\n"
+
+    if findings:
+        content += "| # | File | Line | Function | Rule |\n"
+        content += "|---|------|------|----------|------|\n"
+        for i, e in enumerate(findings, 1):
+            fn = e.get("function", "N/A")
+            content += (
+                f"| {i} | {e['finding']['file']} | {e['finding']['line']} "
+                f"| {fn} | {e['finding'].get('rule_id', 'N/A')} |\n"
+            )
+        content += "\n"
+    else:
+        content += "_No findings to analyze._\n\n"
 
     # Embed call graphs
-    content += "## Call Graphs\n\n"
-    for cg in sorted((report_dir / "callgraphs").glob("*.dot")):
-        content += f"### {cg.name}\n```dot\n{cg.read_text(errors='ignore')}\n```\n\n"
+    cg_dir = report_dir / "callgraphs"
+    if cg_dir.exists():
+        dots = sorted(cg_dir.glob("*.dot"))
+        if dots:
+            content += "## Call Graphs\n\n"
+            per = max(max_dot_chars // len(dots), 800)
+            for cg in dots:
+                raw = cg.read_text(errors='ignore')
+                content += f"### {cg.name}\n```dot\n"
+                content += _truncate(raw, per, cg.name)
+                content += "\n```\n\n"
 
     # Embed CFG slices
-    content += "## CFG Slices\n\n"
-    for sl in sorted((report_dir / "dot_slices").glob("*.dot")):
-        content += f"### {sl.name}\n```dot\n{sl.read_text(errors='ignore')}\n```\n\n"
+    sl_dir = report_dir / "dot_slices"
+    if sl_dir.exists():
+        dots = sorted(sl_dir.glob("*.dot"))
+        if dots:
+            content += "## CFG Slices\n\n"
+            per = max(max_dot_chars // len(dots), 800)
+            for sl in dots:
+                raw = sl.read_text(errors='ignore')
+                content += f"### {sl.name}\n```dot\n"
+                content += _truncate(raw, per, sl.name)
+                content += "\n```\n\n"
 
     # Embed source files
-    content += "## Source Files\n\n"
-    for src in sorted((report_dir / "src").glob("*")):
-        content += f"### {src.name}\n```c\n{src.read_text(errors='ignore')}\n```\n\n"
+    if include_sources:
+        src_d = report_dir / "src"
+        if src_d.exists():
+            srcs = sorted(f for f in src_d.glob("*") if f.is_file())
+            if srcs:
+                content += "## Source Files\n\n"
+                per = max(max_src_chars // len(srcs), 400)
+                for src in srcs:
+                    raw = src.read_text(errors='ignore')
+                    content += f"### {src.name}\n```c\n"
+                    content += _truncate(raw, per, src.name)
+                    content += "\n```\n\n"
+
     # Analysis instructions
     content += (
         "## Analysis Task\n"
-        "First, list every file you received. Then for each finding:\n"
-        "1. Executive Summary\n"
-        "2. Per-Finding Decision Table\n"
-        "3. Conclusion\n"
+        "For each finding:\n"
+        "1. **Executive Summary** — vulnerability class and affected function\n"
+        "2. **Decision Table** — reachable? sanitized? "
+        "Verdict: True Positive / False Positive / Manual Review\n"
+        "3. **Remediation** — concrete fix recommendation\n"
+        "4. **Conclusion** — overall risk level\n"
     )
     return content
 
 
-def send_to_gpt(report_dir: Path, findings: List[Dict],
-                lang: str = "en") -> str:
+def send_to_gpt(
+        report_dir: Path, 
+        findings: List[Dict],
+        lang: str = "en",
+        include_sources: bool = False
+    ) -> str:
     api_key = os.getenv('OPENAI_API_KEY')
     if not api_key:
         raise ValueError("OPENAI_API_KEY environment variable not set")
     
     print("[+] Sending analysis to ChatGPT, lang='{lang}'...")
     client = openai.OpenAI(api_key=api_key)
-    analysis_content = _build_report_content(report_dir, findings)
+    analysis_content = _build_report_content(report_dir, findings, include_sources=include_sources)
     system_prompt = get_system_prompt(lang)
 
     response = client.chat.completions.create(
@@ -867,14 +938,18 @@ def main():
     
     try:
         if args.mode == 'gpt':
-            report_path = send_to_gpt(report_dir, summary, lang=args.lang)
+            report_path = send_to_gpt(
+                report_dir, 
+                summary, 
+                lang=args.lang,
+                include_sources=args.include_sources)
         elif args.mode == 'ollama':
             report_path = send_to_ollama(
                 report_dir, summary, 
                 model=args.ollama_model,
                 base_url=args.ollama_url,
-                lang=args.lang
-            )
+                lang=args.lang,
+                include_sources=args.include_sources)
         elif args.mode == 'llamacpp':
             report_path = send_to_llamacpp(
                 report_dir, summary,
@@ -884,7 +959,7 @@ def main():
                 lang=args.lang,
                 max_tokens=args.llamacpp_max_tokens,
                 temperature=args.llamacpp_temperature,
-            )
+                include_sources=args.include_sources)
         else: # local
             report_path = generate_local_report(report_dir, summary)
             print("\x1b[93m[*] No super-intelligence (even AGI achieved in-house) have been passed.. just creating files and leaving!\x1b[0m")    
