@@ -34,6 +34,8 @@ import pydot
 import time
 import signal
 import psutil
+import concurrent.futures
+import tempfile
 
 # Default arguments (if not present command line)
 DEFAULT_SEMGREP_RULES_DIR = Path(os.getcwd()) / 'semgrep-rules'
@@ -131,32 +133,121 @@ def load_semgrep_results(path: Path) -> list:
     data = json.loads(path.read_text())
     findings = []
     for res in data.get('results', []):
-        p = res.get('path'); src = p.get('repr') if isinstance(p, dict) else p
-        if not src or Path(src).suffix.lower() not in ALLOWED_EXTENSIONS: continue
+        p = res.get('path')
+        src = p.get('repr') if isinstance(p, dict) else p
+        if not src or Path(src).suffix.lower() not in ALLOWED_EXTENSIONS: 
+            continue
         findings.append({
-            'finding': {'file': src, 'line': res['start']['line'], 'rule_id': res.get('check_id')},
+            'finding': {
+                'file': src, 
+                'line': res['start']['line'], 
+                'rule_id': res.get('check_id')
+            },
             'function': res.get('extra', {}).get('metadata', {}).get('function')
         })
     return findings
 
 
+# Automatic generate .ll files using clang compiler
+def _clang_compile_single(src: Path, out_ll: Path,
+                           extra_flags: List[str] = None) -> bool:
+    suffix = src.suffix.lower()
+    compiler = 'clang++' if suffix in {'.cpp', '.hpp'} else 'clang'
+    flags = [
+        '-S', '-emit-llvm',
+        '-g0',            # without debug info
+        '-O0',            # without optimization
+        '-w',             # disable warnings
+        '-I', str(src.parent),
+    ]
+    if extra_flags:
+        flags.extend(extra_flags)
+
+    cmd = [compiler] + flags + [str(src), '-o', str(out_ll)]
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=120
+    )
+    if result.returncode != 0:
+        # print only first error line
+        first_err = result.stderr.decode(errors='replace').splitlines()
+        hint = first_err[0] if first_err else '(no output)'
+        print(f"  [!] {src.name}: {hint}")
+        return False
+    return True
+
+
+# Recursively find all .c .cpp files in project dit and compile to .ll
+def generate_ll_for_project(project_dir: Path, ll_output_dir: Path,
+                              extra_include_dirs: List[str] = None,
+                              jobs: int = 4) -> List[Path]:
+    
+    ll_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # get all include flags
+    extra_flags: List[str] = []
+    if extra_include_dirs:
+        for inc in extra_include_dirs:
+            extra_flags += ['-I', inc]
+
+    # find include folders
+    for candidate in ['include', 'src', 'lib', 'common']:
+        inc_path = project_dir / candidate
+        if inc_path.is_dir():
+            extra_flags += ['-I', str(inc_path)]
+
+    sources = list(project_dir.rglob('*.c')) + list(project_dir.rglob('*.cpp'))
+    print(f"[+] Found {len(sources)} source files. Compiling to LLVM IR "
+          f"(jobs={jobs})...")
+
+    generated: List[Path] = []
+    lock_generated = __import__('threading').Lock()
+
+    def _compile(src: Path):
+        # make unique name
+        rel = src.relative_to(project_dir)
+        stem = str(rel).replace('/', '_').replace('\\', '_').replace(' ', '_')
+        out_ll = ll_output_dir / (stem + '.ll')
+        if out_ll.exists():
+            with lock_generated:
+                generated.append(out_ll)
+            return
+        ok = _clang_compile_single(src, out_ll, extra_flags)
+        if ok:
+            with lock_generated:
+                generated.append(out_ll)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+        list(ex.map(_compile, sources))
+
+    print(f"[+] Successfully compiled {len(generated)}/{len(sources)} files to .ll")
+    return generated
+
+
 def infer_function_name(source_file: Path, line_no: int) -> str | None:
     name = None
-    for idx, line in enumerate(source_file.read_text().splitlines(), start=1):
-        if idx > line_no: break
-        m = FUNC_DEF_REGEX.match(line)
-        if m: name = m.group('name')
+    try:
+        for idx, line in enumerate(source_file.read_text().splitlines(), start=1):
+            if idx > line_no: break
+            m = FUNC_DEF_REGEX.match(line)
+            if m: name = m.group('name')
+    except Exception:
+        pass
     return name
 
 
-def find_ll_file(source_path: str, root: Path) -> Path | None:
+def find_ll_file(source_path: str, root: Path) -> Optional[Path]:
     base = Path(source_path).stem
-    matches = list(root.rglob(f"{base}.ll"))
-    return matches[0] if matches else None
+    for ll in root.rglob('*.ll'):
+        if ll.stem == base or ll.stem.endswith('_' + base):
+            return ll
+    return None
 
 
 def generate_graphs(ll_file: Path, callgraph_dir: Path, cfg_dir: Path) -> Path:
-    print("[+] Generating LLVM callgraph and CFG slices...")
+    print(f"  [+] Generating LLVM callgraph and CFG for {ll_file.name}...")
     stem = ll_file.stem
     cg_dot = callgraph_dir / f"{stem}.ll.callgraph.dot"
     subprocess.run(
@@ -179,24 +270,35 @@ def generate_graphs(ll_file: Path, callgraph_dir: Path, cfg_dir: Path) -> Path:
     return cg_dot
 
 
-def slice_cfg(cfg_path: Path, target_line: int, depth: int = DEFAULT_SLICE_DEPTH) -> str | None:
+def slice_cfg(cfg_path: Path, target_line: int, 
+              depth: int = DEFAULT_SLICE_DEPTH) -> Optional[str]:
     graphs = pydot.graph_from_dot_file(str(cfg_path)) or []
-    if not graphs: return None
+    if not graphs:
+        return None
     graph = graphs[0]
-    nodes = [n for n in graph.get_nodes() if f":{target_line}" in n.get_attributes().get('label','')]
-    if not nodes: return None
-    slice_nodes = set(nodes); frontier = set(nodes)
+    nodes = [n for n in graph.get_nodes()
+             if f":{target_line}" in n.get_attributes().get('label', '')]
+    if not nodes:
+        return None
+    slice_nodes = set(nodes)
+    frontier = set(nodes)
     for _ in range(depth):
-        next_front = set()
+        next_front: Set = set()
         for e in graph.get_edges():
             src, dst = e.get_source(), e.get_destination()
-            if any(n.get_name()==dst for n in frontier): next_front.update(n for n in graph.get_nodes() if n.get_name()==src)
-            if any(n.get_name()==src for n in frontier): next_front.update(n for n in graph.get_nodes() if n.get_name()==dst)
-        slice_nodes |= next_front; frontier = next_front
-    sub = pydot.Dot(graph_type='digraph'); names={n.get_name() for n in slice_nodes}
-    for n in slice_nodes: sub.add_node(n)
+            if any(n.get_name() == dst for n in frontier):
+                next_front.update(n for n in graph.get_nodes() if n.get_name()==src)
+            if any(n.get_name() == src for n in frontier):
+                next_front.update(n for n in graph.get_nodes() if n.get_name()==dst)
+        slice_nodes |= next_front
+        frontier = next_front
+    sub = pydot.Dot(graph_type='digraph') 
+    names = {n.get_name() for n in slice_nodes}
+    for n in slice_nodes: 
+        sub.add_node(n)
     for e in graph.get_edges():
-        if e.get_source() in names and e.get_destination() in names: sub.add_edge(e)
+        if e.get_source() in names and e.get_destination() in names: 
+            sub.add_edge(e)
     return sub.to_string()
 
 
@@ -204,15 +306,12 @@ def copy_source_files(findings: list, project_dir: Path, report_dir: Path) -> No
     print("[+] Copying source files to report...")
     src_dir = report_dir / 'src'
     src_dir.mkdir(exist_ok=True)
-    
     copied_files: Set[str] = set()
     copy_count = 0
-    
     for entry in findings:
         src_file = entry['finding']['file']
         if src_file in copied_files:
             continue
-            
         copied_files.add(src_file)
         
         source_path = project_dir / src_file
@@ -223,12 +322,10 @@ def copy_source_files(findings: list, project_dir: Path, report_dir: Path) -> No
             try:
                 shutil.copy2(source_path, dest_path)
                 copy_count += 1
-                print(f"  Copied: {src_file}")
             except Exception as e:
-                print(f"  Error copying {src_file}: {e}")
+                print(f"  [!] Error copying {src_file}: {e}")
         else:
-            print(f"  Source file not found: {src_file}")
-                    
+            print(f"  [!] Source file not found: {src_file}")
     print(f"[+] Copied {copy_count} source files")
 
 
@@ -383,7 +480,7 @@ def send_to_llamacpp(
         "stream": False,
     }
 
-    print(f"[+] Sending analysis to llama-cpp ({base_url}), model='{model}', lang='{lang}'...")
+    print(f"[+] Sending analysis to llama-cpp ({base_url}), model='{model}', lang='{lang}', max-tokens='{max_tokens}'...")
     response = requests.post(
         f"{base_url.rstrip('/')}/v1/chat/completions",
         headers=headers,
@@ -509,7 +606,28 @@ def build_parser() -> argparse.ArgumentParser:
         metavar='FILENAME',
         help='Semgrep JSON output filename (inside report dir)')
     
-    # TODO LLVM / .ll generation
+    # LLVM / .ll generation
+    llvm_g = parser.add_argument_group('LLVM .ll generation options')
+    llvm_g.add_argument(
+        '--auto-ll', action='store_true',
+        help='Auto-compile project sources to .ll with clang (no pre-built .ll needed)')
+    llvm_g.add_argument(
+        '--ll-dir', type=Path, default=None,
+        metavar='DIR',
+        help='Directory with pre-built .ll files (if not using --auto-ll). '
+             'Defaults to <project_dir>')
+    llvm_g.add_argument(
+        '--include', action='append', dest='extra_includes', default=[],
+        metavar='DIR',
+        help='Extra -I include directory for clang (can be repeated)')
+    llvm_g.add_argument(
+        '--jobs', type=int, default=4,
+        metavar='N',
+        help='Parallel clang jobs for --auto-ll')
+    llvm_g.add_argument(
+        '--slice-depth', type=int, default=DEFAULT_SLICE_DEPTH,
+        metavar='N',
+        help='CFG backward/forward slice depth')
 
     # LLM backend mode
     llm_g = parser.add_argument_group('LLM backend options')
@@ -595,13 +713,24 @@ def main():
     callgraph_dir = report_dir / 'callgraphs'
     cfg_dir = report_dir / 'cfg'
     slices_dir = report_dir / 'dot_slices'
-    # TODO ll_work_dir
+    ll_work_dir   = report_dir / 'll_files'
 
     # make folders
     for d in [report_dir, callgraph_dir, cfg_dir, slices_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # TODO Step 1 - generate .ll files
+    # Step 1 - generate .ll files
+    if args.auto_ll:
+        ll_work_dir.mkdir(exist_ok=True)
+        generated_ll = generate_ll_for_project(
+            project_dir=project,
+            ll_output_dir=ll_work_dir,
+            extra_include_dirs=args.extra_includes,
+            jobs=args.jobs,
+        )
+        ll_search_root = ll_work_dir
+    else:
+        ll_search_root = args.ll_dir.resolve() if args.ll_dir else project
 
     # Step 2 - run Semgrep
     if not run_semgrep(project, report_dir, args.semgrep_rules, args.semgrep_output):
@@ -615,10 +744,9 @@ def main():
     for old in cfg_dir.glob('*.dot'):
         old.unlink()
 
-    # TODO Step 3 - graphs and slices    
-
-    summary = []
-    processed_ll = set()
+    # Step 3 - graphs and slices
+    summary: List[Dict] = []
+    processed_ll: Set[Path] = set()
 
     for entry in findings:
         src_file = project / entry['finding']['file']
@@ -626,29 +754,45 @@ def main():
         if not func:
             continue
         entry['function'] = func
-        ll = find_ll_file(entry['finding']['file'], project)
+
+        ll = find_ll_file(entry['finding']['file'], ll_search_root)
         if not ll:
+            print(f"  [!] No .ll found for {entry['finding']['file']} "
+                  f"(use --auto-ll to generate automatically)")
             continue
+
         if ll not in processed_ll:
-            cg = generate_graphs(ll, callgraph_dir, cfg_dir)
+            try:
+                cg = generate_graphs(ll, callgraph_dir, cfg_dir)
+            except subprocess.CalledProcessError as e:
+                print(f"  [!] Graph generation failed for {ll.name}: {e}")
+                continue
             processed_ll.add(ll)
+        else:
+            # find already generated callgraph
+            cg_candidates = list(callgraph_dir.glob(f"{ll.stem}*.dot"))
+            cg = cg_candidates[0] if cg_candidates else callgraph_dir / f"{ll.stem}.ll.callgraph.dot"
+
         cfg_candidates = list(cfg_dir.glob(f"*{func}.dot"))
         if not cfg_candidates:
             continue
         cfg = cfg_candidates[0]
-        sliced = slice_cfg(cfg, entry['finding']['line']) # TODO use depth
-        out = slices_dir / f"{func}_slice.dot"
+
+        sliced = slice_cfg(cfg, entry['finding']['line'], depth=args.slice_depth)
+        out_slice = slices_dir / f"{func}_slice.dot"
         if sliced:
-            out.write_text(sliced)
+            out_slice.write_text(sliced)
         else:
-            shutil.copy(cfg, out)
+            shutil.copy(cfg, out_slice)
+
         entry['callgraph'] = str(cg.relative_to(report_dir))
-        entry['cfg_slice'] = str(out.relative_to(report_dir))
+        entry['cfg_slice'] = str(out_slice.relative_to(report_dir))
         summary.append(entry)
 
-    # Step 4. LLM Analyze
-    print("\x1b[93m[*] Running LLM analysis (mode={args.mode}, lang={args.lang})...\x1b[0m")
     (report_dir / 'rag_inputs.json').write_text(json.dumps(summary, indent=2))
+
+    # Step 4. LLM Analyze
+    print(f"\x1b[93m[*] Running LLM analysis (mode={args.mode}, lang={args.lang})...\x1b[0m")
     report_path: Optional[str] = None
     
     try:
