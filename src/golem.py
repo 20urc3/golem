@@ -16,13 +16,11 @@
 import os
 import json
 import subprocess
-import glob
 import argparse
 import re
 import shutil
 import requests
 import openai
-import requests
 import chromadb
 import ollama
 from chromadb import PersistentClient
@@ -35,16 +33,16 @@ import time
 import signal
 import psutil
 import concurrent.futures
-import tempfile
+import threading
 
 # Default arguments (if not present command line)
 DEFAULT_SEMGREP_RULES_DIR = Path(os.getcwd()) / 'semgrep-rules'
 DEFAULT_SEMGREP_OUTPUT    = 'result_scan.json'
 DEFAULT_SLICE_DEPTH       = 3
-CALLGRAPH_CMD = 'opt -passes="dot-callgraph"'
-CFG_CMD = 'opt -passes="dot-cfg"'
-ALLOWED_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp'}
-FUNC_DEF_REGEX = re.compile(r'^\s*[\w\*\s]+\s+(?P<name>\w+)\s*\([^)]*\)\s*\{')
+ALLOWED_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.cxx', '.cc'}
+FUNC_DEF_REGEX = re.compile(
+    r'^\s*[\w\*\s]+\s+(?P<name>\w+)\s*\([^)]*\)\s*\{'
+)
 
 # Language prompt
 LANG_PROMPTS = {
@@ -108,24 +106,31 @@ You are a security auditor assistant. For the above Semgrep findings and graph a
 '''
 
 def run_semgrep(project_dir: Path, report_dir: Path,
-                rules_dir: Path, output_filename: str) -> bool:
+                rules_dir: Path, output_filename: str,
+                exclude_patterns: List[str] = None) -> bool:
     print(f"[+] Scanning with Semgrep in '{project_dir}' using rules '{rules_dir}'...")
     output_path = report_dir / output_filename
+    cmd = [
+        'semgrep',
+        '--timeout', '300',
+        '--timeout-threshold', '0',
+        '--max-target-bytes', '0',
+        '--config', str(rules_dir),
+        f'--json-output={output_path}',
+    ]
+    if exclude_patterns:
+        for pat in exclude_patterns:
+            cmd += ['--exclude', pat]
+        print(f"  [i] Excluding patterns: {exclude_patterns}")
+    
+    cmd.append(str(project_dir))
     proc = subprocess.run(
-        [
-            'semgrep',
-            '--timeout', '300',
-            '--timeout-threshold', '0',  
-            '--max-target-bytes', '0',
-            '--config', str(rules_dir),
-            f'--json-output={output_path}',
-            str(project_dir)
-        ],
+        cmd,
         cwd=project_dir,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
-    print("[+] Semgrep scan done!")
+    print("[+] Semgrep done!")
     return proc.returncode == 0
 
 
@@ -135,12 +140,12 @@ def load_semgrep_results(path: Path) -> list:
     for res in data.get('results', []):
         p = res.get('path')
         src = p.get('repr') if isinstance(p, dict) else p
-        if not src or Path(src).suffix.lower() not in ALLOWED_EXTENSIONS: 
+        if not src or Path(src).suffix.lower() not in ALLOWED_EXTENSIONS:
             continue
         findings.append({
             'finding': {
-                'file': src, 
-                'line': res['start']['line'], 
+                'file': src,
+                'line': res['start']['line'],
                 'rule_id': res.get('check_id')
             },
             'function': res.get('extra', {}).get('metadata', {}).get('function')
@@ -152,7 +157,7 @@ def load_semgrep_results(path: Path) -> list:
 def _clang_compile_single(src: Path, out_ll: Path,
                            extra_flags: List[str] = None) -> bool:
     suffix = src.suffix.lower()
-    compiler = 'clang++' if suffix in {'.cpp', '.hpp'} else 'clang'
+    compiler = 'clang++' if suffix in {'.cpp', '.cxx', '.cc', '.hpp'} else 'clang'
     flags = [
         '-S', '-emit-llvm',
         '-g0',            # without debug info
@@ -193,17 +198,19 @@ def generate_ll_for_project(project_dir: Path, ll_output_dir: Path,
             extra_flags += ['-I', inc]
 
     # find include folders
-    for candidate in ['include', 'src', 'lib', 'common']:
+    for candidate in ['include', 'inc', 'src', 'lib', 'common', 'headers']:
         inc_path = project_dir / candidate
         if inc_path.is_dir():
             extra_flags += ['-I', str(inc_path)]
 
-    sources = list(project_dir.rglob('*.c')) + list(project_dir.rglob('*.cpp'))
+    sources = []
+    for ext in ['*.c', '*.cpp', '*.cxx', '*.cc']:
+        sources.extend(project_dir.rglob(ext))
     print(f"[+] Found {len(sources)} source files. Compiling to LLVM IR "
           f"(jobs={jobs})...")
 
     generated: List[Path] = []
-    lock_generated = __import__('threading').Lock()
+    lock = threading.Lock()
 
     def _compile(src: Path):
         # make unique name
@@ -211,12 +218,12 @@ def generate_ll_for_project(project_dir: Path, ll_output_dir: Path,
         stem = str(rel).replace('/', '_').replace('\\', '_').replace(' ', '_')
         out_ll = ll_output_dir / (stem + '.ll')
         if out_ll.exists():
-            with lock_generated:
+            with lock:
                 generated.append(out_ll)
             return
         ok = _clang_compile_single(src, out_ll, extra_flags)
         if ok:
-            with lock_generated:
+            with lock:
                 generated.append(out_ll)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
@@ -238,11 +245,34 @@ def infer_function_name(source_file: Path, line_no: int) -> str | None:
     return name
 
 
-def find_ll_file(source_path: str, root: Path) -> Optional[Path]:
-    base = Path(source_path).stem
-    for ll in root.rglob('*.ll'):
-        if ll.stem == base or ll.stem.endswith('_' + base):
+def find_ll_file(source_path: str, root: Path,
+                project_dir: Optional[Path] = None) -> Optional[Path]:
+
+    src = Path(source_path)
+    base_stem = src.stem
+    all_ll = list(root.rglob('*.ll'))
+
+    # 1. Flatten
+    if project_dir:
+        try:
+            rel = src.relative_to(project_dir)
+        except ValueError:
+            rel = src
+        flat_stem = str(rel).replace('/', '_').replace('\\', '_').replace(' ', '_')
+        for ll in all_ll:
+            if ll.stem == flat_stem:
+                return ll
+
+    # 2. Stem
+    for ll in all_ll:
+        if ll.stem == base_stem:
             return ll
+
+    # 3. Suffix
+    for ll in all_ll:
+        if ll.stem.endswith('_' + base_stem):
+            return ll
+
     return None
 
 
@@ -250,23 +280,34 @@ def generate_graphs(ll_file: Path, callgraph_dir: Path, cfg_dir: Path) -> Path:
     print(f"  [+] Generating LLVM callgraph and CFG for {ll_file.name}...")
     stem = ll_file.stem
     cg_dot = callgraph_dir / f"{stem}.ll.callgraph.dot"
-    subprocess.run(
-        f"{CALLGRAPH_CMD} {ll_file} -o {cg_dot}",
-        cwd=callgraph_dir,
-        shell=True,
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+    r1 = subprocess.run(
+        f'opt -passes="dot-callgraph" "{ll_file}" -o "{cg_dot}"',
+        cwd=str(callgraph_dir), shell=True,
+        capture_output=True, text=True
     )
-    subprocess.run(
-        f"{CFG_CMD} {ll_file}",
-        cwd=cfg_dir,
-        shell=True,
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+    if not cg_dot.exists():
+        raise subprocess.CalledProcessError(
+            r1.returncode, 'opt dot-callgraph', r1.stderr
+        )
+
+    # CFG — cwd=cfg_dir
+    r2 = subprocess.run(
+        f'opt -passes="dot-cfg" "{ll_file}" -o /dev/null',
+        cwd=str(cfg_dir), shell=True,
+        capture_output=True, text=True,
     )
-    print("[+] CFG and callgraph generation done!")
+    # opt : ".foo.dot" to "foo.dot"
+    for hidden in list(cfg_dir.glob(".*.dot")):
+        visible = hidden.parent / hidden.name.lstrip('.')
+        hidden.rename(visible)
+
+    cfg_count = len(list(cfg_dir.glob("*.dot")))
+    if cfg_count == 0:
+        print(f"  [!] dot-cfg: no .dot for {ll_file.name}")
+        if r2.stderr:
+            print(f"      {r2.stderr[:200]}")    
+
+    print(f"[+] CFG ({cfg_count}) and callgraph generation done!")
     return cg_dot
 
 
@@ -280,8 +321,8 @@ def slice_cfg(cfg_path: Path, target_line: int,
              if f":{target_line}" in n.get_attributes().get('label', '')]
     if not nodes:
         return None
-    slice_nodes = set(nodes)
-    frontier = set(nodes)
+    slice_nodes: Set = set(nodes)
+    frontier: Set = set(nodes)
     for _ in range(depth):
         next_front: Set = set()
         for e in graph.get_edges():
@@ -605,6 +646,16 @@ def build_parser() -> argparse.ArgumentParser:
         '--semgrep-output', default=DEFAULT_SEMGREP_OUTPUT,
         metavar='FILENAME',
         help='Semgrep JSON output filename (inside report dir)')
+    semgrep_g.add_argument('--semgrep-exclude', action='append',
+                    dest='semgrep_exclude', default=[], metavar='PATTERN',
+                    help=(
+                        'Exclude semgrep rules by pattern (list).\n'
+                        'Example:\n'
+                        '  --semgrep-exclude "*.tpl.yaml"  — taint/semantic rules\n'
+                        '  --semgrep-exclude "taint*"\n'
+                        '  --semgrep-exclude "semantic*"\n'
+                        'Usage if Semgrep evaulate too long.'
+                    ))
     
     # LLVM / .ll generation
     llvm_g = parser.add_argument_group('LLVM .ll generation options')
@@ -642,6 +693,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(LANG_PROMPTS.keys()),
         default='en',
         help='Language for LLM system prompt and output report')
+    llm_g.add_argument('--include-sources', action='store_true', default=False,
+                    help=(
+                        'Include project sources to LLM prompt.\n'
+                        'WARNING: it increase prompt size and token count.\n'
+                        'Safely for GPT-4 or model with 32k+ context.\n'
+                        'For local llama-cpp or Ollama with 4b-model dont use this flag.'
+                    ))
 
     # Ollama
     ollama_g = parser.add_argument_group('Ollama options (--mode ollama)')
@@ -733,7 +791,8 @@ def main():
         ll_search_root = args.ll_dir.resolve() if args.ll_dir else project
 
     # Step 2 - run Semgrep
-    if not run_semgrep(project, report_dir, args.semgrep_rules, args.semgrep_output):
+    if not run_semgrep(project, report_dir, args.semgrep_rules,
+                       args.semgrep_output, args.semgrep_exclude):
         print("\x1b[91m[ERROR] Semgrep scan failed. Aborting.\x1b[0m")
         return
     findings = load_semgrep_results(report_dir / args.semgrep_output)
@@ -752,20 +811,27 @@ def main():
         src_file = project / entry['finding']['file']
         func = entry['function'] or infer_function_name(src_file, entry['finding']['line'])
         if not func:
+            print(f"  [!] Unknown function in {entry['finding']['file']}:"
+                  f"{entry['finding']['line']}")
+            summary.append(entry)
             continue
         entry['function'] = func
 
-        ll = find_ll_file(entry['finding']['file'], ll_search_root)
+        ll = find_ll_file(entry['finding']['file'], ll_search_root,
+                          project_dir=project)
         if not ll:
             print(f"  [!] No .ll found for {entry['finding']['file']} "
                   f"(use --auto-ll to generate automatically)")
+            summary.append(entry)
             continue
 
         if ll not in processed_ll:
             try:
                 cg = generate_graphs(ll, callgraph_dir, cfg_dir)
+                processed_ll.add(ll)
             except subprocess.CalledProcessError as e:
                 print(f"  [!] Graph generation failed for {ll.name}: {e}")
+                summary.append(entry)
                 continue
             processed_ll.add(ll)
         else:
@@ -775,9 +841,12 @@ def main():
 
         cfg_candidates = list(cfg_dir.glob(f"*{func}.dot"))
         if not cfg_candidates:
+            print(f"  [!] No CFG .dot for function '{func}'")
+            entry['callgraph'] = str(cg.relative_to(report_dir))
+            summary.append(entry)
             continue
-        cfg = cfg_candidates[0]
 
+        cfg = cfg_candidates[0]
         sliced = slice_cfg(cfg, entry['finding']['line'], depth=args.slice_depth)
         out_slice = slices_dir / f"{func}_slice.dot"
         if sliced:
@@ -789,7 +858,8 @@ def main():
         entry['cfg_slice'] = str(out_slice.relative_to(report_dir))
         summary.append(entry)
 
-    (report_dir / 'rag_inputs.json').write_text(json.dumps(summary, indent=2))
+    (report_dir / 'rag_inputs.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+    print(f"[+] rag_inputs.json: {len(summary)} entries")
 
     # Step 4. LLM Analyze
     print(f"\x1b[93m[*] Running LLM analysis (mode={args.mode}, lang={args.lang})...\x1b[0m")
