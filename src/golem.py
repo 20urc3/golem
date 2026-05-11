@@ -14,6 +14,7 @@
     
 #!/usr/bin/env python3
 import os
+import io
 import json
 import subprocess
 import argparse
@@ -39,6 +40,9 @@ import threading
 DEFAULT_SEMGREP_RULES_DIR = Path(os.getcwd()) / 'semgrep-rules'
 DEFAULT_SEMGREP_OUTPUT    = 'result_scan.json'
 DEFAULT_SLICE_DEPTH       = 3
+DEFAULT_LLM_TIMEOUT = 600  # seconds
+MAX_DOT_NODES = 50  # for LLM
+MAX_DOT_EDGES = 100  # for LLM
 ALLOWED_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.cxx', '.cc'}
 FUNC_DEF_REGEX = re.compile(
     r'^\s*[\w\*\s]+\s+(?P<name>\w+)\s*\([^)]*\)\s*\{'
@@ -116,22 +120,32 @@ def run_semgrep(project_dir: Path, report_dir: Path,
         '--timeout-threshold', '0',
         '--max-target-bytes', '0',
         '--config', str(rules_dir),
-        f'--json-output={output_path}',
+        '--json',
+        '-o', str(output_path),
     ]
     if exclude_patterns:
         for pat in exclude_patterns:
-            cmd += ['--exclude', pat]
+            cmd += ['--exclude-rule', pat]
         print(f"  [i] Excluding patterns: {exclude_patterns}")
     
     cmd.append(str(project_dir))
+    print(f"  [i] Running: {' '.join(cmd[:5])}...")
+
     proc = subprocess.run(
         cmd,
         cwd=project_dir,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        capture_output=True,
+        text=True
     )
+
+    if proc.returncode != 0:
+        print(f"  [!] Semgrep warning/error: {proc.stderr[:200]}")
+        if not output_path.exists():
+            print(f"  [ERROR] No output file generated")
+            return False
+
     print("[+] Semgrep done!")
-    return proc.returncode == 0
+    return True
 
 
 def load_semgrep_results(path: Path) -> list:
@@ -428,7 +442,9 @@ def send_to_ollama(
     lang: str = "en",
     include_sources: bool = False,
     max_retries: int = 3,
-    retry_delay: float = 2.0
+    retry_delay: float = 2.0,
+    timeout: int = DEFAULT_LLM_TIMEOUT,
+    simplify_graphs: bool = True,
 ) -> str:
     def wait_for_ollama():
         for attempt in range(1, max_retries + 1):
@@ -455,12 +471,13 @@ def send_to_ollama(
 
     full_prompt = (get_system_prompt(lang) + "\n\n"
             + _build_report_content(report_dir, findings,
-                                    include_sources=include_sources))
+                                    include_sources=include_sources,
+                                    simplify_graphs=simplify_graphs))
 
     response = requests.post(
         f"{base_url}/api/generate",
         json={ "model": model, "prompt": full_prompt, "stream": False},
-        timeout=300
+        timeout=timeout
     )
     response.raise_for_status()
     
@@ -485,6 +502,8 @@ def send_to_llamacpp(
     max_tokens: int = 4096,
     temperature: float = 0.1,
     include_sources: bool = False,
+    timeout: int = DEFAULT_LLM_TIMEOUT,
+    simplify_graphs: bool = True,
 ) -> str:
     health_url = f"{base_url.rstrip('/')}/health"
     try:
@@ -505,7 +524,11 @@ def send_to_llamacpp(
                 f"Error: {e}"
             )
 
-    analysis_content = _build_report_content(report_dir, findings, include_sources=include_sources)
+    analysis_content = _build_report_content(
+        report_dir, findings, 
+        include_sources=include_sources,
+        simplify_graphs=simplify_graphs
+        )
     system_prompt = get_system_prompt(lang)
 
     est_chars = len(system_prompt) + len(analysis_content)
@@ -538,7 +561,7 @@ def send_to_llamacpp(
         f"{base_url.rstrip('/')}/v1/chat/completions",
         headers=headers,
         json=payload,
-        timeout=600,
+        timeout=timeout,
     )
     response.raise_for_status()
 
@@ -572,6 +595,7 @@ def _build_report_content(
     include_sources: bool = False,
     max_dot_chars: int = 8_000,
     max_src_chars: int = 6_000,
+    simplify_graphs: bool = True,
     ) -> str:
     content = "# Security Analysis Report\n\n"
     # List all received files
@@ -656,7 +680,9 @@ def send_to_gpt(
         report_dir: Path, 
         findings: List[Dict],
         lang: str = "en",
-        include_sources: bool = False
+        include_sources: bool = False,
+        timeout: int = DEFAULT_LLM_TIMEOUT,
+        simplify_graphs: bool = True,
     ) -> str:
     api_key = os.getenv('OPENAI_API_KEY')
     if not api_key:
@@ -664,7 +690,11 @@ def send_to_gpt(
     
     print("[+] Sending analysis to ChatGPT, lang='{lang}'...")
     client = openai.OpenAI(api_key=api_key)
-    analysis_content = _build_report_content(report_dir, findings, include_sources=include_sources)
+    analysis_content = _build_report_content(
+        report_dir, findings, 
+        include_sources=include_sources,
+        simplify_graphs=simplify_graphs
+        )
     system_prompt = get_system_prompt(lang)
 
     response = client.chat.completions.create(
@@ -674,7 +704,8 @@ def send_to_gpt(
             {"role": "user","content": analysis_content}
         ],
         max_tokens=4000,
-        temperature=0.1
+        temperature=0.1,
+        timeout=timeout,
     )
         
     analysis = response.choices[0].message.content
@@ -771,6 +802,19 @@ def build_parser() -> argparse.ArgumentParser:
                         'Safely for GPT-4 or model with 32k+ context.\n'
                         'For local llama-cpp or Ollama with 4b-model dont use this flag.'
                     ))
+    llm_g.add_argument(
+        '--llm-timeout', type=int, default=DEFAULT_LLM_TIMEOUT,
+        metavar='SECONDS',
+        help='Timeout for LLM API calls (seconds)'
+    )
+    llm_g.add_argument(
+        '--simplify-graphs', action='store_true', default=True,
+        help='Simplify DOT graphs to reduce token usage (recommended)'
+    )
+    llm_g.add_argument(
+        '--no-simplify-graphs', dest='simplify_graphs', action='store_false',
+        help='Disable graph simplification (may increase token usage)'
+    )
 
     # Ollama
     ollama_g = parser.add_argument_group('Ollama options (--mode ollama)')
@@ -942,14 +986,20 @@ def main():
                 report_dir, 
                 summary, 
                 lang=args.lang,
-                include_sources=args.include_sources)
+                include_sources=args.include_sources,
+                timeout=args.llm_timeout,
+                simplify_graphs=args.simplify_graphs
+                )
         elif args.mode == 'ollama':
             report_path = send_to_ollama(
                 report_dir, summary, 
                 model=args.ollama_model,
                 base_url=args.ollama_url,
                 lang=args.lang,
-                include_sources=args.include_sources)
+                include_sources=args.include_sources,
+                timeout=args.llm_timeout,
+                simplify_graphs=args.simplify_graphs
+                )
         elif args.mode == 'llamacpp':
             report_path = send_to_llamacpp(
                 report_dir, summary,
@@ -959,7 +1009,10 @@ def main():
                 lang=args.lang,
                 max_tokens=args.llamacpp_max_tokens,
                 temperature=args.llamacpp_temperature,
-                include_sources=args.include_sources)
+                include_sources=args.include_sources,
+                timeout=args.llm_timeout,
+                simplify_graphs=args.simplify_graphs
+                )
         else: # local
             report_path = generate_local_report(report_dir, summary)
             print("\x1b[93m[*] No super-intelligence (even AGI achieved in-house) have been passed.. just creating files and leaving!\x1b[0m")    
